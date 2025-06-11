@@ -89,7 +89,7 @@ struct frame_index_cache {
         auto frameIndex = queue.front();
         queue.pop();
         signal.notify_all();
-        std::cout << "after read: qsize, " << queue.size() << std::endl;
+        std::cout << "after read: i,qsize, " << frameIndex << "," << queue.size() << std::endl;
         return frameIndex;
     }
 
@@ -98,7 +98,7 @@ struct frame_index_cache {
 
         queue.push(frameIndex);
         signal.notify_all();
-        std::cout << "after write: qsize, " << queue.size() << std::endl;
+        std::cout << "after write: i,qsize, " << frameIndex << "," << queue.size() << std::endl;
     }
 
     std::mutex mutex;
@@ -106,59 +106,72 @@ struct frame_index_cache {
     std::queue<int> queue;
 };
 
+stdexec::sender auto asyncRead(frame_index_cache* frame_cache)
+{
+    return stdexec::just(frame_cache->read());
+}
+
 int main() {
-    auto io_pool = exec::static_thread_pool(8);
+    auto io_pool = exec::static_thread_pool(2);
     auto io_sched = io_pool.get_scheduler();
+
+    auto main_loop = stdexec::run_loop();
+    auto main_sched = main_loop.get_scheduler();
+
     auto main_scope = exec::async_scope();
     std::atomic_bool stop_reader_requested { false };
     
     auto decoder = hw_decoder();
     auto frame_cache = frame_index_cache();
 
-    int count = 100;
+    const int limit = 100000;
+    int count = limit;
 
     auto frame_decode_and_cache =
         io_sched.schedule()
 
         | stdexec::let_value([&] {
-            return async_decode_frame(&decoder);
+           return async_decode_frame(&decoder)
+                    | stdexec::then([&frame_cache](int frameIndex) {
+                        frame_cache.write(frameIndex);
+                    })
+                    // repeat for `count` iterations
+                    | stdexec::then([&count] {
+                        return --count == 0;
+                    })
+                    | exec::repeat_effect_until()
+                    | stdexec::then([&] {
+                        main_loop.finish();
+                        main_scope.request_stop();
+
+                    })
+                    ;
         })
 
-        | stdexec::then([&frame_cache](int frameIndex) {
-            frame_cache.write(frameIndex);
-        })
-
-        // repeat for `count` iterations
-        | stdexec::then([&count] {
-            return --count == 0;
-        })
-        | exec::repeat_effect_until()
-
-        | stdexec::then([&stop_reader_requested] {
-            //
-            // !!BUG!!: execution never reaches this point
-            //
-
-            stop_reader_requested.store(true);
-        })
         ;
 
     auto frame_reader =
         io_sched.schedule()
-        | stdexec::let_value([&frame_cache] {
-            return stdexec::just(frame_cache.read());
-        })
+        | stdexec::let_value([&] {
+            return stdexec::just(&frame_cache)
+                    | stdexec::let_value(asyncRead)
 
-        | stdexec::then([](int frameIndex){
-            std::cout << "process frame index: " << frameIndex << std::endl;
-        })
+                    | stdexec::continues_on(main_sched)
 
-        | stdexec::then([&stop_reader_requested] { return stop_reader_requested.load(); })
-        | exec::repeat_effect_until()
+                    | stdexec::then([&](int frameIndex){
+                        std::cout << "process frame index: " << frameIndex << std::endl;
+                        return frameIndex == (limit - 1); // last frame
+                    })
+                    | exec::repeat_effect_until()
+              ;
+        })
         ;
 
     main_scope.spawn(std::move(frame_decode_and_cache));
     main_scope.spawn(std::move(frame_reader));
+    main_loop.run();
+
+
     stdexec::sync_wait(main_scope.on_empty());
 
     return 0;
