@@ -1,15 +1,15 @@
 #pragma once
-#include <iostream>
 #include <ranges>
 #include <optional>
 #include <queue>
 #include <mutex>
 #include <condition_variable>
-#include <thread>
 #include <functional>
-#include <chrono>
 
-// Approach 1: Using a blocking queue with timeout
+/// An input range suitable for producer/consumer use cases.
+/// The producer uses `write()` to add items to the range.
+/// The consumer uses the normal `std::ranges` range adaptors.
+/// Internally items are buffered in a thread-safe blocking queue.
 template<typename T>
 class buffering_range {
 private:
@@ -34,11 +34,10 @@ public:
     private:
         const buffering_range* parent_;
         std::optional<T> current_;
-        bool at_end_ = false;
 
     public:
-        using iterator_concept = std::forward_iterator_tag;
-        using iterator_category = std::forward_iterator_tag;
+        using iterator_concept = std::input_iterator_tag;
+        using iterator_category = std::input_iterator_tag;
         using value_type = T;
         using difference_type = std::ptrdiff_t;
         using pointer = T*;
@@ -46,11 +45,9 @@ public:
 
         iterator() = default;
 
-        explicit iterator(const buffering_range* parent, bool at_end = false)
-            : parent_(parent), at_end_(at_end) {
-            if (!at_end_) {
-                ++(*this); // Load first item
-            }
+        explicit iterator(const buffering_range* parent)
+            : parent_(parent) {
+            ++(*this); // Load first item
         }
 
          // Copy/move constructors and assignment operators
@@ -63,24 +60,16 @@ public:
         ~iterator() = default;
 
         iterator& operator++() {
-            if (at_end_) return *this;
+            auto lock = std::unique_lock(parent_->mutex_);
             
-            std::unique_lock<std::mutex> lock(parent_->mutex_);
-            
-            // Wait for data with timeout
-            if (parent_->cv_.wait_for(lock, std::chrono::milliseconds(100), 
-                [this] { return !parent_->buffer_.empty() || parent_->finished_; })) {
+            // Wait for data
+            parent_->cv_.wait(lock,
+                [this] { return !parent_->buffer_.empty() || parent_->finished_; });
                 
-                if (!parent_->buffer_.empty()) {
-                    current_ = std::move(parent_->buffer_.front());
-                    parent_->buffer_.pop();
-                } else {
-                    at_end_ = true;
-                    current_.reset();
-                }
+            if (!parent_->buffer_.empty()) {
+                current_ = std::move(parent_->buffer_.front());
+                parent_->buffer_.pop();
             } else {
-                // Timeout - treat as end
-                at_end_ = true;
                 current_.reset();
             }
             
@@ -98,16 +87,14 @@ public:
         }
 
         bool operator==(std::default_sentinel_t) const {
-            return at_end_;
+            auto lock = std::unique_lock(parent_->mutex_);
+            return parent_->finished_;
         }
 
         // Equality operators (required for incrementable via weakly_equality_comparable)
         friend bool operator==(const iterator& lhs, const iterator& rhs) {
 
-        std::optional<T> current_;
-        bool at_end_ = false;
             return lhs.parent_ == rhs.parent_ &&
-                   lhs.at_end_ == rhs.at_end_ &&
                    (!lhs.current_ && !rhs.current_) || *lhs.current_ == *rhs.current_;
         }
     };
