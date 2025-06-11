@@ -1,4 +1,6 @@
+// Copyright (c) 2025 Peter Tran. All rights reserved.
 #pragma once
+
 #include <ranges>
 #include <optional>
 #include <queue>

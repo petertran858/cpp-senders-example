@@ -1,3 +1,5 @@
+// Copyright (c) 2025 Peter Tran. All rights reserved.
+
 #include <iostream>
 #include <exec/async_scope.hpp>
 #include <exec/repeat_effect_until.hpp>
