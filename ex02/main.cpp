@@ -1,143 +1,73 @@
 #include <iostream>
-#include <ranges>
-#include <optional>
-#include <queue>
-#include <mutex>
-#include <condition_variable>
-#include <thread>
-#include <functional>
-#include <future>
-#include <chrono>
+#include "buffering_range.hpp"
 
-// Approach 1: Using a blocking queue with timeout
-template<typename T>
-class async_callback_range {
-private:
-    mutable std::queue<T> buffer_;
-    mutable std::mutex mutex_;
-    mutable std::condition_variable cv_;
-    mutable bool finished_ = false;
-    std::function<void(std::function<void(T)>)> callback_setup_;
+#include <exec/async_scope.hpp>
+#include <exec/repeat_effect_until.hpp>
+#include <exec/sequence/ignore_all_values.hpp>
+#include <exec/sequence/iterate.hpp>
+#include <exec/sequence/transform_each.hpp>
+#include <exec/single_thread_context.hpp>
+#include <exec/static_thread_pool.hpp>
 
-public:
-    explicit async_callback_range(std::function<void(std::function<void(T)>)> setup)
-        : callback_setup_(std::move(setup)) {
-        
-        // Set up the callback when range is created
-        callback_setup_([this](T item) {
-            std::lock_guard<std::mutex> lock(mutex_);
-            buffer_.push(std::move(item));
-            cv_.notify_one();
-        });
-    }
-
-    class iterator {
-    private:
-        const async_callback_range* parent_;
-        std::optional<T> current_;
-        bool at_end_ = false;
-
-    public:
-        using iterator_concept = std::input_iterator_tag;
-        using iterator_category = std::input_iterator_tag;
-        using value_type = T;
-        using difference_type = std::ptrdiff_t;
-        using pointer = T*;
-        using reference = const T&;
-
-        explicit iterator(const async_callback_range* parent, bool at_end = false)
-            : parent_(parent), at_end_(at_end) {
-            if (!at_end_) {
-                ++(*this); // Load first item
-            }
-        }
-
-        iterator& operator++() {
-            if (at_end_) return *this;
-            
-            std::unique_lock<std::mutex> lock(parent_->mutex_);
-            
-            // Wait for data with timeout
-            if (parent_->cv_.wait_for(lock, std::chrono::milliseconds(100), 
-                [this] { return !parent_->buffer_.empty() || parent_->finished_; })) {
-                
-                if (!parent_->buffer_.empty()) {
-                    current_ = std::move(parent_->buffer_.front());
-                    parent_->buffer_.pop();
-                } else {
-                    at_end_ = true;
-                    current_.reset();
-                }
-            } else {
-                // Timeout - treat as end
-                at_end_ = true;
-                current_.reset();
-            }
-            
-            return *this;
-        }
-
-        void operator++(int) {
-            ++(*this);
-        }
-
-        const T& operator*() const {
-            return *current_;
-        }
-
-        bool operator==(std::default_sentinel_t) const {
-            return at_end_;
-        }
+/// A mock HW decoder.
+struct hw_decoder
+{
+    struct client_data_t {
     };
 
-    iterator begin() const {
-        return iterator(this);
+    using callback_t = std::function<void(client_data_t*, int)>;
+
+    // simulate a HW decoder's async callback
+    void decode_next_frame(client_data_t* clientData, callback_t on_frame_cb) {
+        auto s1 =
+            ctx.get_scheduler().schedule()
+            | stdexec::then([=, this]{
+                on_frame_cb(clientData, index++);
+            })
+            ;
+
+        scope.spawn(std::move(s1));
     }
 
-    std::default_sentinel_t end() const {
-        return std::default_sentinel;
+    ~hw_decoder() {
+        stdexec::sync_wait(scope.on_empty());
     }
 
-    void finish() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        finished_ = true;
-        cv_.notify_all();
-    }
+    exec::single_thread_context ctx;
+    exec::async_scope scope;
+    int index {};
 };
 
-// Make it satisfy the range concept
-template<typename T>
-inline constexpr bool std::ranges::enable_borrowed_range<async_callback_range<T>> = false;
-
-// Helper function to create the range
-template<typename T>
-auto make_async_callback_range(std::function<void(std::function<void(T)>)> setup) {
-    return async_callback_range<T>(std::move(setup));
-}
 
 // Example usage
 int main() {
-    // Example 1: Simulating async callbacks (like WebSocket messages)
-    std::optional<std::thread> t;
-    auto range = make_async_callback_range<int>([&t](auto callback) {
-        // Simulate async source in another thread
-        t = std::thread([callback = std::move(callback)]() {
-            for (int i = 0; i < 10; ++i) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                callback(i * i); // Send i^2
+    auto decoder = hw_decoder();
+
+    auto client_data = hw_decoder::client_data_t{};
+
+    auto range = make_buffering_range<int>();
+
+    for (int i = 0; i < 10; ++i) {
+        decoder.decode_next_frame(
+            &client_data,
+            [&range](hw_decoder::client_data_t*, int value) {
+                range.write(value);
             }
-        });
-        t->detach();
-    });
-
-    std::this_thread::sleep_for(std::chrono::milliseconds(500)); // Allow time for async processing
-
-    // Use with ranges algorithms
-    for (auto value : range | std::views::take(5)) {
-        std::cout << "Received value: " << value << std::endl;
+        );
     }
 
-    t->join();
+    int total = 0;
+    auto sum =
+        exec::iterate(range | std::views::take(5))
+        | exec::transform_each(stdexec::then([&total](auto value)
+            {
+                total += value;
+            }))
+        ;
+
+    stdexec::sync_wait(exec::ignore_all_values(sum));
+
+    std::cout << "Total: " << total << std::endl;
 
     return 0;
 }
