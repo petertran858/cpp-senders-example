@@ -1,45 +1,51 @@
 // Copyright (c) 2025 Peter Tran. All rights reserved.
 #pragma once
 
-#include <ranges>
-#include <optional>
-#include <queue>
-#include <mutex>
 #include <condition_variable>
 #include <functional>
+#include <mutex>
+#include <optional>
+#include <queue>
+#include <ranges>
 
-/// An input range suitable for producer/consumer use cases.
-/// The producer uses `write()` to add items to the range.
+template<typename T>
+using write_gate_func = std::function<bool(const std::queue<T>& q)>;
+
+/// An input range that allows items to be appended for producer-consumer use cases.
+/// The producer uses `add()` to add items to the range.
 /// The consumer uses the normal `std::ranges` range adaptors.
 /// Internally items are buffered in a thread-safe blocking queue.
 template<typename T>
-class buffering_range {
+class producer_range {
 private:
     mutable std::queue<T> buffer_;
     mutable std::mutex mutex_;
     mutable std::condition_variable cv_;
     mutable bool finished_ = false;
-    std::function<void(std::function<void(T)>)> callback_setup_;
+    write_gate_func<T> write_gate_;
 
 public:
-    buffering_range() = default;
-    ~buffering_range() = default;
+    producer_range(write_gate_func<T> write_gate) {
+        write_gate_ = write_gate;
+    }
+    ~producer_range() = default;
 
     template<typename Item = T>
-    void write(Item&& item) {
+    void add(Item&& item) {
         auto lock = std::lock_guard(mutex_);
-        buffer_.push(std::forward<Item>(item));
-        cv_.notify_one();
+        if (!finished_) {
+            buffer_.push(std::forward<Item>(item));
+        }
+        cv_.notify_all();
     }
 
     class iterator {
     private:
-        const buffering_range* parent_;
+        const producer_range* parent_;
         std::optional<T> current_;
 
     public:
         using iterator_concept = std::input_iterator_tag;
-        using iterator_category = std::input_iterator_tag;
         using value_type = T;
         using difference_type = std::ptrdiff_t;
         using pointer = T*;
@@ -47,12 +53,12 @@ public:
 
         iterator() = default;
 
-        explicit iterator(const buffering_range* parent)
+        explicit iterator(const producer_range* parent)
             : parent_(parent) {
             ++(*this); // Load first item
         }
 
-         // Copy/move constructors and assignment operators
+        // Copy/move constructors and assignment operators
         iterator(const iterator&) = default;
         iterator(iterator&&) = default;
         iterator& operator=(const iterator&) = default;
@@ -71,6 +77,7 @@ public:
             if (!parent_->buffer_.empty()) {
                 current_ = std::move(parent_->buffer_.front());
                 parent_->buffer_.pop();
+                parent_->cv_.notify_all();
             } else {
                 current_.reset();
             }
@@ -79,7 +86,7 @@ public:
         }
 
         iterator operator++(int) {
-            iterator temp = *this;
+            iterator temp = std::move(*this);
             ++(*this);
             return temp;
         }
@@ -114,14 +121,21 @@ public:
         finished_ = true;
         cv_.notify_all();
     }
+
+    stdexec::sender auto async_write_gate() {
+        auto lock = std::unique_lock(mutex_);
+        // Wait for gate to open
+        cv_.wait(lock, [this] { return write_gate_(buffer_) || finished_; });
+        return stdexec::just();
+    }
 };
 
 // Make it satisfy the range concept
 template<typename T>
-inline constexpr bool std::ranges::enable_borrowed_range<buffering_range<T>> = false;
+inline constexpr bool std::ranges::enable_borrowed_range<producer_range<T>> = false;
 
 // Helper function to create the range
 template<typename T>
-auto make_buffering_range() {
-    return buffering_range<T>();
+auto make_producer_range(write_gate_func<T> write_gate) {
+    return producer_range<T>(write_gate);
 }

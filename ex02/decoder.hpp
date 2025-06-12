@@ -17,7 +17,8 @@ struct hw_decoder
     void decode_next_frame(client_data_t* clientData, callback_t on_frame_cb) {
         auto s1 =
             ctx.get_scheduler().schedule()
-            | stdexec::then([=, this]{
+            | stdexec::then([=, this] {
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
                 on_frame_cb(clientData, index++);
             })
             ;

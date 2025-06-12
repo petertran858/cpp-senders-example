@@ -9,28 +9,36 @@
 #include <exec/single_thread_context.hpp>
 #include <exec/static_thread_pool.hpp>
 
-#include "buffering_range.hpp"
+#include "producer_range.hpp"
 #include "decoder.hpp"
 
 int main() {
-    auto io_context = exec::single_thread_context();
+    auto transfer_context = exec::single_thread_context();
+    auto read_context = exec::single_thread_context();
     auto main_loop = stdexec::run_loop();
     auto main_scope = exec::async_scope();
 
     auto decoder = hw_decoder();
 
-    auto frame_cache_range = make_buffering_range<int>();
+    const int frame_cache_limit = 1;
+    auto frame_cache = make_producer_range<int>([frame_cache_limit](const std::queue<int>& q){
+        return q.size() < frame_cache_limit;
+    });
 
     int count = 10;
 
     auto frame_transfer =
-        io_context.get_scheduler().schedule()
+        transfer_context.get_scheduler().schedule()
         | stdexec::let_value([&] {
             return
-                async_decode_frame(&decoder)
-                | stdexec::then([&](auto value) {
-                    std::cout << "frame_transfer: " << value << std::endl;
-                    frame_cache_range.write(value);
+                stdexec::just()
+                | stdexec::let_value([&] { return frame_cache.async_write_gate(); })
+
+                | stdexec::let_value([&] { return async_decode_frame(&decoder); })
+
+                | stdexec::then([&](auto&& item) {
+                    //std::cout << "frame_transfer: " << item << std::endl;
+                    frame_cache.add(item);
                 })
 
                 // repeat for `count` iterations
@@ -47,10 +55,10 @@ int main() {
 
     int total = 0;
     auto frame_reader =
-        io_context.get_scheduler().schedule()
+        read_context.get_scheduler().schedule()
         | stdexec::let_value([&] {
             return
-                exec::iterate(std::views::all(frame_cache_range))
+                exec::iterate(std::views::all(frame_cache))
                 | exec::transform_each(stdexec::then([&total](auto value) {
                     std::cout << "frame_reader: " << value << std::endl;
                     total += value;
@@ -65,13 +73,14 @@ int main() {
                 });
         });
 
-    main_scope.spawn(std::move(frame_transfer));
     main_scope.spawn(std::move(frame_reader));
+    main_scope.spawn(std::move(frame_transfer));
 
     // Uncomment to simulate an external stop request
     std::thread([&] {
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
-        frame_cache_range.finish();
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        std::cout << "frame_cache.finish" << std::endl;
+        frame_cache.finish();
     }).detach();
 
     stdexec::sync_wait(main_scope.on_empty());
