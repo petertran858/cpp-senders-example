@@ -12,6 +12,11 @@
 #include "producer_range.hpp"
 #include "decoder.hpp"
 
+void process_frame(const hw_frame& frame, int32_t& total) {
+    std::cout << "frame_reader: [" << frame.index << "]: " << frame.data[0] << std::endl;
+    total += frame.index;
+}
+
 int main() {
     auto transfer_context = exec::single_thread_context();
     auto read_context = exec::single_thread_context();
@@ -59,9 +64,9 @@ int main() {
         | stdexec::let_value([&] {
             return
                 exec::iterate(std::views::all(frame_cache))
-                | exec::transform_each(stdexec::then([&total](auto&& frame) {
-                    std::cout << "frame_reader: [" << frame.index << "]: " << frame.data[0] << std::endl;
-                    total += frame.index;
+                | exec::transform_each(stdexec::then([&total](auto& frame) {
+                    // at this point we only get a const lvalue ref to the frame
+                    process_frame(frame, total);
                 }))
                 | exec::ignore_all_values()
 
