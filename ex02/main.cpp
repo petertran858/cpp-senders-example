@@ -21,7 +21,7 @@ int main() {
     auto decoder = hw_decoder();
 
     const int frame_cache_limit = 1;
-    auto frame_cache = make_producer_range<int>([frame_cache_limit](const std::queue<int>& q){
+    auto frame_cache = make_producer_range<hw_frame>([frame_cache_limit](const std::queue<hw_frame>& q){
         return q.size() < frame_cache_limit;
     });
 
@@ -36,9 +36,9 @@ int main() {
 
                 | stdexec::let_value([&] { return async_decode_frame(&decoder); })
 
-                | stdexec::then([&](auto&& item) {
-                    //std::cout << "frame_transfer: " << item << std::endl;
-                    frame_cache.add(item);
+                | stdexec::then([&](auto&& frame) {
+                    // std::cout << "frame_transfer: " << frame.index << std::endl;
+                    frame_cache.add(std::move(frame));
                 })
 
                 // repeat for `count` iterations
@@ -59,9 +59,9 @@ int main() {
         | stdexec::let_value([&] {
             return
                 exec::iterate(std::views::all(frame_cache))
-                | exec::transform_each(stdexec::then([&total](auto value) {
-                    std::cout << "frame_reader: " << value << std::endl;
-                    total += value;
+                | exec::transform_each(stdexec::then([&total](auto&& frame) {
+                    std::cout << "frame_reader: [" << frame.index << "]: " << frame.data[0] << std::endl;
+                    total += frame.index;
                 }))
                 | exec::ignore_all_values()
 
