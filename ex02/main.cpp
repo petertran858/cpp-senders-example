@@ -12,7 +12,19 @@
 #include "ondemand_range.hpp"
 #include "decoder.hpp"
 
-void process_frame(const hw_frame& frame, int32_t& total) {
+auto make_frame_sequence(hw_decoder& decoder) {
+    return ondemand_sequence<hw_frame>(
+        // sender to provide items
+        [&decoder]{ return async_decode_frame<hw_frame>(&decoder); },
+
+        // sender for until predicate
+        [&] { return stdexec::just(false); }
+    );
+}
+
+void process_frame(auto&& frame, int32_t& total) {
+    static_assert(std::is_rvalue_reference_v<decltype(frame)>);
+
     std::cout << "frame_reader: [" << frame.index << "]: " << frame.data[0] << std::endl;
     total += frame.index;
 }
@@ -25,17 +37,17 @@ int main() {
 
     auto decoder = hw_decoder();
 
-    auto frame_cache = make_ondemand_range<hw_frame>([&decoder]{ return async_decode_frame(&decoder); } );
+    // frame sequence is an input_range that knows how to fetch frames from decoder
+    auto frame_sequence = make_frame_sequence(decoder);
 
     int total = 0;
     auto frame_reader =
         read_context.get_scheduler().schedule()
         | stdexec::let_value([&] {
             return
-                exec::iterate(std::views::all(frame_cache))
-                | exec::transform_each(stdexec::then([&total](auto& frame) {
-                    // at this point we only get a const lvalue ref to the frame
-                    process_frame(frame, total);
+                exec::iterate(std::move(frame_sequence))
+                | exec::transform_each(stdexec::then([&total](auto&& frame) {
+                    process_frame(std::forward<decltype(frame)>(frame), total);
                 }))
                 | exec::ignore_all_values()
 
@@ -52,8 +64,7 @@ int main() {
     // Uncomment to simulate an external stop request
     std::thread([&] {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        std::cout << "frame_cache.finish" << std::endl;
-        frame_cache.finish();
+        main_scope.request_stop();
     }).detach();
 
     stdexec::sync_wait(main_scope.on_empty());
